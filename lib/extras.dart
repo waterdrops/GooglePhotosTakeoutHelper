@@ -1,8 +1,9 @@
 import 'package:path/path.dart' as p;
+import 'package:unorm_dart/unorm_dart.dart' as unorm;
 
 import 'media.dart';
 
-const _extraFormats = [
+const extraFormats = [
   // EN/US - thanks @DalenW
   '-edited',
   '-effects',
@@ -18,6 +19,12 @@ const _extraFormats = [
   '-編集済み',
   // IT - thanks @rgstori
   '-modificato',
+  // FR - for @palijn's problems <3
+  '-modifié',
+  // ES - @Sappstal report
+  '-ha editado',
+    // CA - @Sappstal report
+  '-editat',
   // Add more "edited" flags in more languages if you want.
   // They need to be lowercase.
 ];
@@ -28,9 +35,11 @@ int removeExtras(List<Media> media) {
   final copy = media.toList();
   var count = 0;
   for (final m in copy) {
-    final name = p.withoutExtension(p.basename(m.file.path)).toLowerCase();
-    for (final extra in _extraFormats) {
-      if (name.endsWith(extra)) {
+    final name = p.withoutExtension(p.basename(m.firstFile.path)).toLowerCase();
+    for (final extra in extraFormats) {
+      // MacOS uses NFD that doesn't work with our accents 🙃🙃
+      // https://github.com/TheLastGimbus/GooglePhotosTakeoutHelper/pull/247
+      if (unorm.nfc(name).endsWith(extra)) {
         media.remove(m);
         count++;
         break;

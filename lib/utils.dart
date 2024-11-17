@@ -6,13 +6,18 @@ import 'package:mime/mime.dart';
 import 'package:path/path.dart' as p;
 import 'package:proper_filesize/proper_filesize.dart';
 
+import 'media.dart';
+
 // remember to bump this
-const version = '3.2.0';
+const version = '3.4.3';
+
+/// max file size to read for exif/hash/anything
+const maxFileSize = 64 * 1024 * 1024;
 
 /// convenient print for errors
 void error(Object? object) => stderr.write('$object\n');
 
-void quit([int code = 1]) {
+Never quit([int code = 1]) {
   if (interactive.indeed) {
     print('[gpth ${code != 0 ? 'quitted :(' : 'finished :)'} (code $code) - '
         'press enter to close]');
@@ -25,7 +30,12 @@ extension X on Iterable<FileSystemEntity> {
   /// Easy extension allowing you to filter for files that are photo or video
   Iterable<File> wherePhotoVideo() => whereType<File>().where((e) {
         final mime = lookupMimeType(e.path) ?? "";
-        return mime.startsWith('image/') || mime.startsWith('video/');
+        return mime.startsWith('image/') ||
+            mime.startsWith('video/') ||
+            // https://github.com/TheLastGimbus/GooglePhotosTakeoutHelper/issues/223
+            // https://github.com/dart-lang/mime/issues/102
+            // 🙃🙃
+            mime == 'model/vnd.mts';
       });
 }
 
@@ -33,22 +43,17 @@ extension Y on Stream<FileSystemEntity> {
   /// Easy extension allowing you to filter for files that are photo or video
   Stream<File> wherePhotoVideo() => whereType<File>().where((e) {
         final mime = lookupMimeType(e.path) ?? "";
-        return mime.startsWith('image/') || mime.startsWith('video/');
+        return mime.startsWith('image/') ||
+            mime.startsWith('video/') ||
+            // https://github.com/TheLastGimbus/GooglePhotosTakeoutHelper/issues/223
+            // https://github.com/dart-lang/mime/issues/102
+            // 🙃🙃
+            mime == 'model/vnd.mts';
       });
 }
 
 extension Util on Stream {
   Stream<T> whereType<T>() => where((e) => e is T).cast<T>();
-}
-
-/// This will add (1) add end of file name over and over until file with such
-/// name doesn't exist yet. Will leave without "(1)" if is free already
-File findNotExistingName(File initialFile) {
-  var file = initialFile;
-  while (file.existsSync()) {
-    file = File('${p.withoutExtension(file.path)}(1)${p.extension(file.path)}');
-  }
-  return file;
 }
 
 Future<int?> getDiskFree([String? path]) async {
@@ -107,3 +112,24 @@ String filesize(int bytes) => ProperFilesize.generateHumanReadableFilesize(
       base: Bases.Binary,
       decimals: 2,
     );
+
+int outputFileCount(List<Media> media, String albumOption) {
+  if (['shortcut', 'duplicate-copy'].contains(albumOption)) {
+    return media.fold(0, (prev, e) => prev + e.files.length);
+  } else if (albumOption == 'json') {
+    return media.length;
+  } else if (albumOption == 'nothing') {
+    return media.where((e) => e.files.containsKey(null)).length;
+  } else {
+    throw ArgumentError.value(albumOption, 'albumOption');
+  }
+}
+
+extension Z on String {
+  /// Returns same string if pattern not found
+  String replaceLast(String from, String to) {
+    final lastIndex = lastIndexOf(from);
+    if (lastIndex == -1) return this;
+    return replaceRange(lastIndex, lastIndex + from.length, to);
+  }
+}
