@@ -3,10 +3,12 @@ import 'dart:io';
 import 'package:args/args.dart';
 import 'package:console_bars/console_bars.dart';
 import 'package:gpth/date_extractor.dart';
-import 'package:gpth/duplicate.dart';
 import 'package:gpth/extras.dart';
+import 'package:gpth/folder_classify.dart';
+import 'package:gpth/grouping.dart';
 import 'package:gpth/interactive.dart' as interactive;
 import 'package:gpth/media.dart';
+import 'package:gpth/moving.dart';
 import 'package:gpth/utils.dart';
 import 'package:path/path.dart' as p;
 
@@ -16,6 +18,7 @@ gpth is ment to help you with exporting your photos from Google Photos.
 
 First, go to https://takeout.google.com/ , deselect all and select only Photos.
 When ready, download all .zips, and extract them into *one* folder.
+(Auto-extracting works only in interactive mode)
 
 Then, run: gpth --input "folder/with/all/takeouts" --output "your/output/folder"
 ...and gpth will parse and organize all photos into one big chronological folder
@@ -39,6 +42,13 @@ void main(List<String> arguments) async {
         abbr: 'i', help: 'Input folder with *all* takeouts *extracted*. ')
     ..addOption('output',
         abbr: 'o', help: 'Output folder where all photos will land')
+    ..addOption(
+      'albums',
+      help: 'What to do about albums?',
+      allowed: interactive.albumOptions.keys,
+      allowedHelp: interactive.albumOptions,
+      defaultsTo: 'shortcut',
+    )
     ..addFlag('divide-to-dates', help: 'Divide output to folders by year/month')
     ..addFlag('skip-extras', help: 'Skip extra images (like -edited etc)')
     ..addFlag(
@@ -81,23 +91,39 @@ void main(List<String> arguments) async {
     await interactive.greet();
     print('');
     // ask for everything
-    final zips = await interactive.getZips();
+    // @Deprecated('Interactive unzipping is suspended for now!')
+    // final zips = await interactive.getZips();
+    late Directory inDir;
+    try {
+      inDir = await interactive.getInputDir();
+    } catch (e) {
+      print("Hmm, interactive selecting input dir crashed... \n"
+          "it looks like you're running in headless/on Synology/NAS...\n"
+          "If so, you have to use cli options - run 'gpth --help' to see them");
+      exit(69);
+    }
     print('');
     final out = await interactive.getOutput();
     print('');
-
-    // calculate approx space required for everything
-    final cumZipsSize = zips.map((e) => e.lengthSync()).reduce((a, b) => a + b);
-    final requiredSpace = (cumZipsSize * 2) + 256 * 1024 * 1024;
-    await interactive.freeSpaceNotice(requiredSpace, out); // and notify this
+    args['divide-to-dates'] = await interactive.askDivideDates();
+    print('');
+    args['albums'] = await interactive.askAlbums();
     print('');
 
-    final unzipDir = Directory(p.join(out.path, '.gpth-unzipped'));
-    args['input'] = unzipDir.path;
+    // @Deprecated('Interactive unzipping is suspended for now!')
+    // // calculate approx space required for everything
+    // final cumZipsSize = zips.map((e) => e.lengthSync()).reduce((a, b) => a + b);
+    // final requiredSpace = (cumZipsSize * 2) + 256 * 1024 * 1024;
+    // await interactive.freeSpaceNotice(requiredSpace, out); // and notify this
+    // print('');
+    //
+    // final unzipDir = Directory(p.join(out.path, '.gpth-unzipped'));
+    // args['input'] = unzipDir.path;
+    args['input'] = inDir.path;
     args['output'] = out.path;
-
-    await interactive.unzip(zips, unzipDir);
-    print('');
+    //
+    // await interactive.unzip(zips, unzipDir);
+    // print('');
   }
 
   // elastic list of extractors - can add/remove with cli flags
@@ -107,6 +133,9 @@ void main(List<String> arguments) async {
     jsonExtractor,
     exifExtractor,
     if (args['guess-from-name']) guessExtractor,
+    // this is potentially *dangerous* - see:
+    // https://github.com/TheLastGimbus/GooglePhotosTakeoutHelper/issues/175
+    (f) => jsonExtractor(f, tryhard: true),
   ];
 
   /// ##### Occasional Fix mode #####
@@ -167,36 +196,13 @@ void main(List<String> arguments) async {
           // allow input folder to be inside output
           .where((e) => p.absolute(e.path) != p.absolute(args['input']))
           .isEmpty) {
-    print('Output folder IS NOT EMPTY! What to do? Type either:');
-    print('[1] - delete *all* files inside output folder and continue');
-    print('[2] - continue as usual - put output files alongside existing');
-    print('[3] - exit program to examine situation yourself');
-    final answer = stdin
-        .readLineSync()!
-        .replaceAll('[', '')
-        .replaceAll(']', '')
-        .toLowerCase()
-        .trim();
-    switch (answer) {
-      case '1':
-        print('Okay, deleting all files inside output folder...');
-        await for (final file in output
-            .list()
-            // delete everything except input folder if there
-            .where((e) => p.absolute(e.path) != p.absolute(args['input']))) {
-          await file.delete(recursive: true);
-        }
-        break;
-      case '2':
-        print('Okay, continuing as usual...');
-        break;
-      case '3':
-        print('Okay, exiting...');
-        quit(0);
-        break;
-      default:
-        print('Unknown answer, exiting...');
-        quit(3);
+    if (await interactive.askForCleanOutput()) {
+      await for (final file in output
+          .list()
+          // delete everything except input folder if there
+          .where((e) => p.absolute(e.path) != p.absolute(args['input']))) {
+        await file.delete(recursive: true);
+      }
     }
   }
   await output.create(recursive: true);
@@ -211,6 +217,31 @@ void main(List<String> arguments) async {
   // No shitheads, you did not overhear - we *mutate* the whole list and objects
   // inside it. This is not Flutter-ish, but it's not Flutter - it's a small
   // simple script, and this the best solution 😎💯
+
+  // Okay, more details on what will happen here:
+  // 1. We find *all* media in either year folders or album folders.
+  //    Every single file will be a separate [Media] object.
+  //    If given [Media] was found in album folder, it will have it noted
+  // 2. We [removeDuplicates] - if two files in same/null album have same hash,
+  //    one will be removed. Note that there are still duplicates from different
+  //    albums left. This is intentional
+  // 3. We guess their dates. Functions in [dateExtractors] are used in order
+  //    from most to least accurate
+  // 4. Now we [findAlbums]. This will analyze [Media] that have same hashes,
+  //    and leave just one with all [albums] filled.
+  //    final exampleMedia = [
+  //      Media('lonePhoto.jpg'),
+  //      Media('photo1.jpg, albums=null),
+  //      Media('photo1.jpg, albums={Vacation}),
+  //      Media('photo1.jpg, albums={Friends}),
+  //    ];
+  //    findAlbums(exampleMedia);
+  //    exampleMedia == [
+  //      Media('lonePhoto.jpg'),
+  //      Media('photo1.jpg, albums={Vacation, Friends}),
+  //    ];
+  //
+
   /// Big global media list that we'll work on
   final media = <Media>[];
 
@@ -221,36 +252,43 @@ void main(List<String> arguments) async {
   /// not matching "Photos from ...." name
   final albumFolders = <Directory>[];
 
-  /// ##### Find all photos/videos and add to list #####
+  /// ##### Find literally *all* photos/videos and add to list #####
 
   print('Okay, running... searching for everything in input folder...');
 
   // recursive=true makes it find everything nicely even if user id dumb 😋
   await for (final d in input.list(recursive: true).whereType<Directory>()) {
-    isYear(Directory dir) => p.basename(dir.path).startsWith('Photos from ');
-    if (isYear(d)) {
+    if (isYearFolder(d)) {
       yearFolders.add(d);
-    } // if not year but got any year brothers
-    else if (await d.parent
-        .list()
-        .whereType<Directory>()
-        .any((e) => isYear(e))) {
+    } else if (await isAlbumFolder(d)) {
       albumFolders.add(d);
     }
   }
-  await for (final f in Stream.fromIterable(yearFolders)) {
+  for (final f in yearFolders) {
     await for (final file in f.list().wherePhotoVideo()) {
-      media.add(Media(file));
+      media.add(Media({null: file}));
+    }
+  }
+  for (final a in albumFolders) {
+    await for (final file in a.list().wherePhotoVideo()) {
+      media.add(Media({albumName(a): file}));
     }
   }
 
-  print('Found ${media.length} photos/videos in input folder');
+  if (media.isEmpty) {
+    await interactive.nothingFoundMessage();
+    // @Deprecated('Interactive unzipping is suspended for now!')
+    // if (interactive.indeed) {
+    //   print('([interactive] removing unzipped folder...)');
+    //   await input.delete(recursive: true);
+    // }
+    quit(13);
+  }
 
   /// ##################################################
 
   /// ##### Find duplicates #####
 
-  // TODO: Check if we even need to print this if it's maybe fast enough
   print('Finding duplicates...');
 
   final countDuplicates = removeDuplicates(media);
@@ -264,15 +302,20 @@ void main(List<String> arguments) async {
 
   /// ###################################
 
-  /// ##### Find albums #####
-
-  // Now, this is awkward...
-  // we can find albums without a problem, but we have no idea what
-  // to do about it 🤷
-  // so just print it now (flex)
-  // findAlbums(albumFolders, media).forEach(print);
-
-  /// #######################
+  // NOTE FOR MYSELF/whatever:
+  // I placed extracting dates *after* removing duplicates.
+  // Today i thought to myself - shouldn't this be reversed?
+  // Finding correct date is our *biggest* priority, and duplicate that we just
+  // removed might have been the chosen one
+  //
+  // But on the other hand, duplicates must be hash-perfect, so they contain
+  // same exifs, and we can just compare length of their names - in 9999% cases,
+  // one with shorter name will have json and others will not 🤷
+  // ...and we would potentially waste a lot of time searching for all of their
+  //    jsons
+  // ...so i'm leaving this like that 😎
+  //
+  // Ps. BUT i've put album merging *after* guess date - notes below
 
   /// ##### Extracting/predicting dates using given extractors #####
 
@@ -284,7 +327,7 @@ void main(List<String> arguments) async {
   for (var i = 0; i < media.length; i++) {
     var q = 0;
     for (final extractor in dateExtractors) {
-      final date = await extractor(media[i].file);
+      final date = await extractor(media[i].firstFile);
       if (date != null) {
         media[i].dateTaken = date;
         media[i].dateTakenAccuracy = q;
@@ -295,45 +338,47 @@ void main(List<String> arguments) async {
       q++;
     }
     if (media[i].dateTaken == null) {
-      print("\nCan't get date on ${media[i].file.path}");
+      print("\nCan't get date on ${media[i].firstFile.path}");
     }
   }
   print('');
 
   /// ##############################################################
 
+  /// ##### Find albums #####
+
+  // I'm placing merging duplicate Media into albums after guessing date for
+  // each one individually, because they are in different folder.
+  // I wish that, thanks to this, we may find some jsons in albums that would
+  // be broken in shithole of big-ass year folders
+
+  print('Finding albums (this may take some time, dont worry :) ...');
+  findAlbums(media);
+
+  /// #######################
+
   /// ##### Copy/move files to actual output folder #####
 
   final barCopy = FillingBar(
-    total: media.length,
-    desc: "${args['copy'] ? 'Coping' : 'Moving'} files to output folder",
+    total: outputFileCount(media, args['albums']),
+    desc: "${args['copy'] ? 'Copying' : 'Moving'} photos to output folder",
     width: barWidth,
   );
-  await for (final m in Stream.fromIterable(media)) {
-    final date = m.dateTaken;
-    final folder = args['divide-to-dates']
-        ? Directory(
-            date == null
-                ? p.join(output.path, 'date-unknown')
-                : p.join(output.path, '${date.year}', '${date.month}'),
-          )
-        : output;
-    if (args['divide-to-dates']) await folder.create(recursive: true);
-    final freeFile =
-        findNotExistingName(File(p.join(folder.path, p.basename(m.file.path))));
-    final c = args['copy']
-        ? await m.file.copy(freeFile.path)
-        : await m.file.rename(freeFile.path);
-    await c.setLastModified(m.dateTaken ?? DateTime.now());
-    barCopy.increment();
-  }
+  await moveFiles(
+    media,
+    output,
+    copy: args['copy'],
+    divideToDates: args['divide-to-dates'],
+    albumBehavior: args['albums'],
+  ).listen((_) => barCopy.increment()).asFuture();
   print('');
 
-  // remove unzipped folder if was created
-  if (interactive.indeed) {
-    print('Removing unzipped folder...');
-    await input.delete(recursive: true);
-  }
+  // @Deprecated('Interactive unzipping is suspended for now!')
+  // // remove unzipped folder if was created
+  // if (interactive.indeed) {
+  //   print('Removing unzipped folder...');
+  //   await input.delete(recursive: true);
+  // }
 
   /// ###################################################
 
@@ -345,14 +390,12 @@ void main(List<String> arguments) async {
   if (countPoop > 0) {
     print("Couldn't find date for $countPoop photos/videos :/");
   }
-  print('${args['copy'] ? 'Copied' : 'Moved'} ${media.length} '
-      'files to "${output.path}"');
   print('');
   print(
     "Last thing - I've spent *a ton* of time on this script - \n"
     "if I saved your time and you want to say thanks, you can send me a tip:\n"
+    "https://www.paypal.me/TheLastGimbus\n"
     "https://ko-fi.com/thelastgimbus\n"
-    "https://paypal.me/TheLastGimbus\n"
     "Thank you ❤",
   );
   print('=' * barWidth);
